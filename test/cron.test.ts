@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { matchesCron, nextRun, parseCron } from "../src/cron.js"
+import { matchesCron, nextDailyAt, nextRun, parseCron } from "../src/cron.js"
 
 describe("parseCron", () => {
   it("parses a valid expression", () => {
@@ -96,6 +96,31 @@ describe("nextRun", () => {
   it("handles minute wrap within an hour", () => {
     const from = new Date(2026, 8, 11, 10, 45, 0)
     expect(nextRun("5,10 * * * *", from)).toEqual(new Date(2026, 8, 11, 11, 5))
+  })
+})
+
+describe("nextDailyAt", () => {
+  it("returns the same day when the time is still ahead", () => {
+    const from = new Date(2026, 8, 11, 8, 0, 0)
+    expect(nextDailyAt("09:30", from)).toEqual(new Date(2026, 8, 11, 9, 30))
+  })
+
+  it("rolls to tomorrow when the time has passed", () => {
+    const from = new Date(2026, 8, 11, 10, 0, 0)
+    expect(nextDailyAt("09:30", from)).toEqual(new Date(2026, 8, 12, 9, 30))
+  })
+
+  it("accepts midnight and single-digit hours", () => {
+    const from = new Date(2026, 8, 11, 10, 0, 0)
+    expect(nextDailyAt("0:05", from)).toEqual(new Date(2026, 8, 12, 0, 5))
+  })
+
+  it("rejects malformed values", () => {
+    const from = new Date(2026, 8, 11, 10, 0, 0)
+    expect(() => nextDailyAt("24:00", from)).toThrow("HH:MM")
+    expect(() => nextDailyAt("9:60", from)).toThrow("HH:MM")
+    expect(() => nextDailyAt("nine", from)).toThrow("HH:MM")
+    expect(() => nextDailyAt("9", from)).toThrow("HH:MM")
   })
 })
 

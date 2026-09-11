@@ -3,10 +3,15 @@ import * as path from "node:path"
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { z } from "zod"
-import { nextRun, parseCron } from "./cron.js"
+import { nextDailyAt, nextRun, parseCron } from "./cron.js"
 
 const MetadataKey = "opencode-cron"
 const MAX_TIMEOUT_MS = 2 ** 31 - 1
+// Limits aligned with omp-cron-extension.
+const MIN_SECONDS = 5
+const MAX_JOBS = 32
+const MAX_PROMPT = 4_000
+const MAX_NAME = 80
 
 const PermissionRuleSchema = z.object({
   permission: z.string(),
@@ -25,13 +30,24 @@ const LastRunSchema = z.object({
 })
 export const JobSchema = z.object({
   name: z.string().min(1),
-  schedule: z.string().min(1),
   prompt: z.string().min(1),
+  // Exactly one schedule field is present (enforced at create/update).
+  schedule: z.string().optional(), // 5-field cron
+  everySeconds: z.number().optional(),
+  dailyAt: z.string().optional(), // "HH:MM" local time
+  onceInSeconds: z.number().optional(),
+  // "session" injects the prompt into the creating session (default);
+  // "task" runs the prompt in a fresh standalone session.
+  target: z.enum(["session", "task"]).optional(),
+  sessionID: z.string().optional(), // target=session: the session the job was created in
   agent: z.string().optional(),
   model: z.string().optional(),
   variant: z.string().optional(),
+  onBusy: z.enum(["queue", "cancel"]).optional(), // default queue
+  missed: z.enum(["skip", "run_once"]).optional(), // default skip
   enabled: z.boolean(),
   createdAt: z.string(),
+  nextAt: z.number().optional(), // epoch ms of the armed occurrence (missed-run detection)
   lastRun: LastRunSchema.optional(),
 })
 export const StoreSchema = z.object({
@@ -89,6 +105,14 @@ const PromptResultSchema = z.object({
       .passthrough(),
   ),
 })
+const SessionStatusMapSchema = z.record(
+  z.string(),
+  z
+    .object({
+      type: z.string(),
+    })
+    .passthrough(),
+)
 
 type Client = PluginInput["client"]
 type ApiResult = { data?: unknown; error?: unknown; response?: Response }
@@ -169,6 +193,33 @@ export function fileStoreIO(worktree: string): StoreIO {
   }
 }
 
+type ScheduleInput = { schedule?: string; every_seconds?: number; daily_at?: string; once_in_seconds?: number }
+
+function parseScheduleInput(input: ScheduleInput): Partial<Job> {
+  const given = [input.schedule, input.every_seconds, input.daily_at, input.once_in_seconds].filter(
+    (value) => value !== undefined,
+  )
+  if (given.length !== 1) {
+    throw new Error("schedule / every_seconds / daily_at / once_in_seconds: provide exactly one")
+  }
+  if (input.schedule !== undefined) {
+    parseCron(input.schedule)
+    return { schedule: input.schedule }
+  }
+  if (input.every_seconds !== undefined) {
+    if (input.every_seconds < MIN_SECONDS) throw new Error(`every_seconds must be at least ${MIN_SECONDS}`)
+    return { everySeconds: Math.round(input.every_seconds) }
+  }
+  if (input.daily_at !== undefined) {
+    nextDailyAt(input.daily_at, new Date())
+    return { dailyAt: input.daily_at }
+  }
+  if (input.once_in_seconds === undefined || input.once_in_seconds < MIN_SECONDS) {
+    throw new Error(`once_in_seconds must be at least ${MIN_SECONDS}`)
+  }
+  return { onceInSeconds: Math.round(input.once_in_seconds) }
+}
+
 type CronTool = ReturnType<typeof tool>
 
 export async function createCron(
@@ -178,6 +229,7 @@ export async function createCron(
   const jobs = new Map<string, Job>()
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const inFlight = new Set<string>()
+  const pendingRun = new Set<string>()
   let disposed = false
 
   function clearTimer(name: string) {
@@ -188,16 +240,43 @@ export async function createCron(
     }
   }
 
-  function scheduleJob(job: Job) {
+  function targetOf(job: Job): "session" | "task" {
+    // Jobs stored before targets existed ran headless; keep that behavior.
+    return job.target ?? "task"
+  }
+
+  function scheduleKindOf(job: Job): "cron" | "every" | "daily" | "once" {
+    if (job.everySeconds !== undefined) return "every"
+    if (job.dailyAt !== undefined) return "daily"
+    if (job.onceInSeconds !== undefined) return "once"
+    return "cron"
+  }
+
+  function nextFireAt(job: Job, from: Date): Date {
+    switch (scheduleKindOf(job)) {
+      case "cron":
+        return nextRun(job.schedule ?? "* * * * *", from)
+      case "every":
+        return new Date(from.getTime() + (job.everySeconds ?? MIN_SECONDS) * 1000)
+      case "daily":
+        return nextDailyAt(job.dailyAt ?? "00:00", from)
+      case "once":
+        return new Date(from.getTime() + (job.onceInSeconds ?? MIN_SECONDS) * 1000)
+    }
+  }
+
+  function scheduleJob(job: Job, options?: { persist?: boolean }) {
     clearTimer(job.name)
     if (!job.enabled || disposed) return
-    const target = nextRun(job.schedule, io.now())
+    const target = nextFireAt(job, io.now())
+    job.nextAt = target.getTime()
+    if (options?.persist !== false) void persist()
     const delay = Math.max(0, target.getTime() - io.now().getTime())
     if (delay > MAX_TIMEOUT_MS) {
       // setTimeout cannot hold delays past ~24.8 days (monthly schedules); re-arm later.
-      timers.set(job.name, setTimeout(() => scheduleJob(job), MAX_TIMEOUT_MS))
+      timers.set(job.name, setTimeout(() => scheduleJob(job, options), MAX_TIMEOUT_MS))
     } else {
-      timers.set(job.name, setTimeout(() => void fireJob(job), delay))
+      timers.set(job.name, setTimeout(() => void onFired(job), delay))
     }
   }
 
@@ -231,8 +310,12 @@ export async function createCron(
     }))
   }
 
-  async function validateJobFields(input: { schedule?: string; prompt?: string; agent?: string; model?: string; variant?: string }) {
-    if (input.schedule !== undefined) parseCron(input.schedule)
+  async function validateJobFields(input: {
+    prompt?: string
+    agent?: string
+    model?: string
+    variant?: string
+  } & ScheduleInput) {
     if (input.prompt !== undefined && input.prompt.trim().length === 0) {
       throw new Error("prompt must not be empty")
     }
@@ -247,7 +330,8 @@ export async function createCron(
     }
   }
 
-  async function executeJob(job: Job) {
+  /** Run the prompt in a fresh standalone session with unattended-safe permissions. */
+  async function executeTaskJob(job: Job) {
     const startedAt = io.now()
     let sessionID: string | undefined
     try {
@@ -264,7 +348,7 @@ export async function createCron(
         : {}
       const createBody = {
         title: `cron: ${job.name}`,
-        metadata: { [MetadataKey]: { name: job.name, schedule: job.schedule } },
+        metadata: { [MetadataKey]: { name: job.name, kind: scheduleKindOf(job) } },
         permission: await deniedPermissions(),
         ...model,
         ...agent,
@@ -305,29 +389,107 @@ export async function createCron(
     }
   }
 
-  async function runIfIdle(job: Job): Promise<boolean> {
-    if (inFlight.has(job.name)) return false
+  async function isSessionBusy(sessionID: string): Promise<boolean> {
+    try {
+      const map = parseResult(await client.session.status(), SessionStatusMapSchema, "Get session status")
+      const type = map[sessionID]?.type
+      return type === "busy" || type === "retry"
+    } catch {
+      return false
+    }
+  }
+
+  /** Inject the prompt into the session the job was created in (omp-style). */
+  async function dispatchSession(job: Job): Promise<string> {
+    const sessionID = job.sessionID
+    if (!sessionID) {
+      await updateJob(job.name, {
+        lastRun: { at: io.now().toISOString(), status: "failed", error: "session task has no sessionID" },
+      })
+      return "failed"
+    }
+    const busy = await isSessionBusy(sessionID)
+    if (busy && (job.onBusy ?? "queue") === "cancel") return "skipped"
+    try {
+      const selection = await resolveSelection(job)
+      const agent = job.agent ? { agent: job.agent } : {}
+      const model = selection
+        ? { model: selection.model, ...(selection.variant ? { variant: selection.variant } : {}) }
+        : {}
+      const body = {
+        parts: [{ type: "text" as const, text: `⏰ 定时任务 [${job.name}] 触发，请执行：\n${job.prompt}` }],
+        ...model,
+        ...agent,
+      }
+      // Generated SDK types lag behind the server HttpApi, which accepts variant here.
+      const result = (await client.session.promptAsync({ path: { id: sessionID }, body } as never)) as ApiResult
+      if (result.data === undefined) {
+        if (result.response?.status === 404) {
+          // A session-scoped task dies with its session.
+          jobs.delete(job.name)
+          clearTimer(job.name)
+          await persist()
+          console.warn(`[opencode-cron] session ${sessionID} no longer exists; removed task "${job.name}"`)
+          return "skipped"
+        }
+        const detail = result.error === undefined ? `HTTP ${result.response?.status ?? "error"}` : JSON.stringify(result.error)
+        throw new Error(`Inject scheduled prompt failed: ${detail}`)
+      }
+      await updateJob(job.name, {
+        lastRun: { at: io.now().toISOString(), sessionID, status: "completed" },
+      })
+      return "completed"
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await updateJob(job.name, {
+        lastRun: { at: io.now().toISOString(), sessionID, status: "failed", error: message },
+      })
+      return "failed"
+    }
+  }
+
+  async function dispatchTask(job: Job): Promise<string> {
+    if (inFlight.has(job.name)) {
+      if ((job.onBusy ?? "queue") === "cancel") return "skipped"
+      pendingRun.add(job.name)
+      return "queued"
+    }
     inFlight.add(job.name)
     try {
-      await executeJob(job)
+      await executeTaskJob(job)
+      if (pendingRun.delete(job.name)) await executeTaskJob(job)
     } finally {
       inFlight.delete(job.name)
     }
-    return true
+    return "completed"
   }
 
-  async function fireJob(job: Job) {
+  function dispatch(job: Job): Promise<string> {
+    return targetOf(job) === "session" ? dispatchSession(job) : dispatchTask(job)
+  }
+
+  async function onFired(job: Job) {
     if (disposed) return
-    await runIfIdle(job)
     const current = jobs.get(job.name)
-    if (current?.enabled && !disposed) scheduleJob(current)
+    if (!current || !current.enabled) return
+    if (scheduleKindOf(current) === "once") {
+      jobs.delete(current.name)
+      clearTimer(current.name)
+      await persist()
+    }
+    await dispatch(current)
+    const again = jobs.get(current.name)
+    if (again?.enabled && !disposed) {
+      scheduleJob(again, { persist: false })
+      await persist()
+    }
   }
 
   function jobSummary(job: Job) {
     let next: string | undefined
     if (job.enabled) {
       try {
-        next = nextRun(job.schedule, io.now()).toISOString()
+        next = nextFireAt(job, io.now()).toISOString()
       } catch {
         next = undefined
       }
@@ -337,17 +499,23 @@ export async function createCron(
 
   const cronTool = tool({
     description:
-      "Manage scheduled tasks. Each task runs a prompt in a fresh session on a 5-field cron schedule (server local time) while OpenCode is running. Use the list action to see existing tasks, their next run time, and last run status.",
+      "Manage scheduled tasks. A task runs a prompt either by injecting it into the session it was created in (target session, default; idle sessions start a new turn, busy sessions follow on_busy) or in a fresh standalone session (target task). Schedule is exactly one of: 5-field cron expression (schedule, server local time), every_seconds, daily_at (\"HH:MM\" local), once_in_seconds. OpenCode must be running at the trigger time. Use the list action to see existing tasks, their next run time, and last run status.",
     args: {
       action: tool.schema.enum(["list", "create", "update", "remove", "enable", "disable", "run"]),
       name: tool.schema.string().min(1).optional(),
       schedule: tool.schema.string().min(1).optional(),
+      every_seconds: tool.schema.number().optional(),
+      daily_at: tool.schema.string().optional(),
+      once_in_seconds: tool.schema.number().optional(),
+      target: tool.schema.enum(["session", "task"]).optional(),
       prompt: tool.schema.string().min(1).optional(),
       agent: tool.schema.string().min(1).optional(),
       model: tool.schema.string().min(1).optional(),
       variant: tool.schema.string().min(1).optional(),
+      on_busy: tool.schema.enum(["queue", "cancel"]).optional(),
+      missed: tool.schema.enum(["skip", "run_once"]).optional(),
     },
-    async execute(input) {
+    async execute(input, context) {
       switch (input.action) {
         case "list": {
           const list = [...jobs.values()].map((job) => jobSummary(job))
@@ -355,37 +523,61 @@ export async function createCron(
         }
         case "create": {
           if (!input.name) throw new Error("name is required to create a task")
-          if (!input.schedule) throw new Error("schedule is required to create a task")
           if (!input.prompt) throw new Error("prompt is required to create a task")
-          if (jobs.has(input.name)) throw new Error(`A task named "${input.name}" already exists`)
-          await validateJobFields(input)
+          if (jobs.size >= MAX_JOBS) throw new Error(`Task limit reached (${MAX_JOBS}); remove a task first`)
+          const name = input.name.trim().slice(0, MAX_NAME)
+          const prompt = input.prompt.trim().slice(0, MAX_PROMPT)
+          if (!name) throw new Error("name must not be empty")
+          if (!prompt) throw new Error("prompt must not be empty")
+          if (jobs.has(name)) throw new Error(`A task named "${name}" already exists`)
+          const schedule = parseScheduleInput(input)
+          await validateJobFields({ ...input, prompt })
           const job: Job = {
-            name: input.name,
-            schedule: input.schedule,
-            prompt: input.prompt,
+            name,
+            prompt,
+            ...schedule,
+            target: input.target ?? "session",
+            sessionID: context.sessionID,
             agent: input.agent,
             model: input.model,
             variant: normalizeVariant(input.variant),
+            onBusy: input.on_busy ?? "queue",
+            missed: input.missed ?? "skip",
             enabled: true,
             createdAt: io.now().toISOString(),
           }
           jobs.set(job.name, job)
+          scheduleJob(job, { persist: false })
           await persist()
-          scheduleJob(job)
           return JSON.stringify({ created: jobSummary(job) }, null, 2)
         }
         case "update": {
           if (!input.name) throw new Error("name is required to update a task")
           const job = jobs.get(input.name)
           if (!job) throw new Error(`Unknown task: ${input.name}`)
+          // A provided schedule field replaces the whole schedule configuration.
+          if (input.schedule !== undefined || input.every_seconds !== undefined || input.daily_at !== undefined || input.once_in_seconds !== undefined) {
+            const schedule = parseScheduleInput(input)
+            delete job.schedule
+            delete job.everySeconds
+            delete job.dailyAt
+            delete job.onceInSeconds
+            Object.assign(job, schedule)
+          }
+          if (input.prompt !== undefined) {
+            const prompt = input.prompt.trim().slice(0, MAX_PROMPT)
+            if (!prompt) throw new Error("prompt must not be empty")
+            job.prompt = prompt
+          }
           await validateJobFields(input)
-          if (input.schedule !== undefined) job.schedule = input.schedule
-          if (input.prompt !== undefined) job.prompt = input.prompt
           if (input.agent !== undefined) job.agent = input.agent
           if (input.model !== undefined) job.model = input.model
           if (input.variant !== undefined) job.variant = normalizeVariant(input.variant)
+          if (input.on_busy !== undefined) job.onBusy = input.on_busy
+          if (input.missed !== undefined) job.missed = input.missed
+          if (input.target !== undefined) job.target = input.target
+          scheduleJob(job, { persist: false })
           await persist()
-          scheduleJob(job)
           return JSON.stringify({ updated: jobSummary(job) }, null, 2)
         }
         case "remove": {
@@ -400,8 +592,8 @@ export async function createCron(
           const job = jobs.get(input.name)
           if (!job) throw new Error(`Unknown task: ${input.name}`)
           job.enabled = true
+          scheduleJob(job, { persist: false })
           await persist()
-          scheduleJob(job)
           return JSON.stringify({ enabled: jobSummary(job) }, null, 2)
         }
         case "disable": {
@@ -417,11 +609,18 @@ export async function createCron(
           if (!input.name) throw new Error("name is required to run a task")
           const job = jobs.get(input.name)
           if (!job) throw new Error(`Unknown task: ${input.name}`)
-          if (inFlight.has(job.name)) {
-            return JSON.stringify({ status: "skipped", reason: `task "${job.name}" is already running` }, null, 2)
+          if (targetOf(job) === "task" && inFlight.has(job.name)) {
+            const queued = (job.onBusy ?? "queue") === "queue"
+            // The dispatch registers the queued occurrence or drops it per on_busy.
+            void dispatch(job)
+            return JSON.stringify(
+              { status: queued ? "queued" : "skipped", name: job.name, reason: `task "${job.name}" is already running` },
+              null,
+              2,
+            )
           }
-          // executeJob records the run in lastRun; the tool returns immediately.
-          void runIfIdle(job)
+          // The dispatch records the run in lastRun; the tool returns immediately.
+          void dispatch(job)
           return JSON.stringify({ status: "started", name: job.name }, null, 2)
         }
       }
@@ -429,9 +628,17 @@ export async function createCron(
   })
 
   const store = await io.load()
+  const now = io.now().getTime()
+  const missed: Job[] = []
   for (const job of store?.jobs ?? []) {
+    if (job.enabled && job.nextAt !== undefined && job.nextAt <= now) missed.push(job)
     jobs.set(job.name, job)
-    scheduleJob(job)
+    scheduleJob(job, { persist: false })
+  }
+  // Missed runs: "run_once" fires once (per job, never accumulated); the
+  // default "skip" keeps the reschedule scheduleJob already applied.
+  for (const job of missed) {
+    if ((job.missed ?? "skip") === "run_once") void onFired(job)
   }
 
   return {

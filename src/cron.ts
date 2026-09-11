@@ -147,3 +147,17 @@ export function matchesCron(expr: string, date: Date): boolean {
     dayMatches(fields, date)
   )
 }
+
+/** "HH:MM" (24-hour, local time) -> the next time that hour:minute occurs, strictly after `from`. */
+export function nextDailyAt(at: string, from: Date): Date {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(at.trim())
+  const hour = match ? Number(match[1]) : NaN
+  const minute = match ? Number(match[2]) : NaN
+  if (!match || !(hour >= 0 && hour < 24) || !(minute >= 0 && minute < 60)) {
+    throw new Error(`daily_at must be "HH:MM" in 24-hour local time, got: ${at}`)
+  }
+  const result = new Date(from)
+  result.setHours(hour, minute, 0, 0)
+  if (result.getTime() <= from.getTime()) result.setDate(result.getDate() + 1)
+  return result
+}
