@@ -132,16 +132,16 @@ describe("cron tool", () => {
     await dispose()
   })
 
-  it("rejects duplicate names, invalid schedules, unknown agents, and bad models", async () => {
+  it("rejects duplicate names and schedules that are missing or invalid", async () => {
     const { client, io } = setup()
     const { tool, dispose } = await createCron(client, io)
     const base = { action: "create", name: "job", schedule: "* * * * *", prompt: "hi" }
     await call(tool.cron, base)
     await expect(call(tool.cron, base)).rejects.toThrow("already exists")
     await expect(call(tool.cron, { ...base, name: "bad-schedule", schedule: "* * * *" })).rejects.toThrow("5 fields")
-    await expect(call(tool.cron, { ...base, name: "two", schedule: "* * * * *", every_seconds: 5 })).rejects.toThrow(
-      "exactly one",
-    )
+    await expect(
+      call(tool.cron, { ...base, name: "bad-mix", schedule: "* * * *", every_seconds: 3 }),
+    ).rejects.toThrow("exactly one")
     await expect(call(tool.cron, { action: "create", name: "none", prompt: "hi" })).rejects.toThrow("exactly one")
     await expect(
       call(tool.cron, { action: "create", name: "short", prompt: "hi", every_seconds: 3 }),
@@ -149,19 +149,91 @@ describe("cron tool", () => {
     await expect(
       call(tool.cron, { action: "create", name: "daily", prompt: "hi", daily_at: "25:00" }),
     ).rejects.toThrow("HH:MM")
-    await expect(
-      call(tool.cron, { ...base, name: "agent", agent: "nope" }),
-    ).rejects.toThrow("Unknown agent")
-    await expect(
-      call(tool.cron, { ...base, name: "model", model: "openai/missing" }),
-    ).rejects.toThrow("Unknown model")
-    await expect(
-      call(tool.cron, { ...base, name: "conn", model: "offline/model" }),
-    ).rejects.toThrow("not connected")
-    await expect(
-      call(tool.cron, { ...base, name: "variant", model: "openai/main", variant: "no" }),
-    ).rejects.toThrow("Unknown variant")
     expect(io.store()?.jobs).toHaveLength(1)
+    await dispose()
+  })
+
+  it("tolerates padded optional fields from strict tool-call providers", async () => {
+    const { client, io } = setup()
+    const { tool, dispose } = await createCron(client, io)
+    const result = await call(tool.cron, {
+      action: "create",
+      name: "padded",
+      prompt: "hi",
+      schedule: "0 * * * *",
+      every_seconds: 3600,
+      daily_at: "",
+      once_in_seconds: 0,
+      target: "task",
+      agent: "open-code",
+      model: "x",
+      variant: "x",
+      condition: "x",
+      token_file: "x",
+      missed: "skip",
+      on_busy: "queue",
+    })
+    expect(result.created.schedule).toBe("0 * * * *")
+    expect(result.created.everySeconds).toBeUndefined()
+    expect(result.created.agent).toBeUndefined()
+    expect(result.created.model).toBeUndefined()
+    expect(result.created.condition).toBeUndefined()
+    expect(result.warnings.length).toBeGreaterThan(0)
+
+    const nulls = await call(tool.cron, {
+      action: "create",
+      name: "nulls",
+      prompt: "hi",
+      schedule: null,
+      every_seconds: null,
+      daily_at: null,
+      once_in_seconds: 300,
+    })
+    expect(nulls.created.onceInSeconds).toBe(300)
+    await dispose()
+  })
+
+  it("keeps the existing schedule when update carries several valid schedule fields", async () => {
+    const { client, io } = setup()
+    const { tool, dispose } = await createCron(client, io)
+    await call(tool.cron, {
+      action: "create",
+      name: "job",
+      every_seconds: 5,
+      prompt: "hi",
+      model: "openai/main",
+      variant: "high",
+    })
+    const padded = await call(tool.cron, {
+      action: "update",
+      name: "job",
+      prompt: "updated",
+      schedule: "* * * * *",
+      daily_at: "00:00",
+      every_seconds: 7200,
+      once_in_seconds: 1,
+      agent: "x",
+      model: "x",
+      variant: "x",
+      condition: "x",
+      token_file: "x",
+    })
+    expect(padded.updated.prompt).toBe("updated")
+    expect(padded.updated.everySeconds).toBe(5)
+    expect(padded.updated.schedule).toBeUndefined()
+    expect(padded.updated.model).toBe("openai/main")
+    expect(padded.warnings.length).toBeGreaterThan(0)
+
+    const single = await call(tool.cron, {
+      action: "update",
+      name: "job",
+      schedule: "30 11 * * *",
+      every_seconds: 0,
+      daily_at: "",
+      once_in_seconds: 1,
+    })
+    expect(single.updated.schedule).toBe("30 11 * * *")
+    expect(single.updated.everySeconds).toBeUndefined()
     await dispose()
   })
 

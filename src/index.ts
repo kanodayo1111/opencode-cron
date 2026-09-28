@@ -201,6 +201,18 @@ export function fileStoreIO(worktree: string): StoreIO {
 
 type ScheduleInput = { schedule?: string; every_seconds?: number; daily_at?: string; once_in_seconds?: number }
 
+const SCHEDULE_FIELDS = ["schedule", "every_seconds", "daily_at", "once_in_seconds"] as const
+
+function dropBlankValues(input: Record<string, unknown>): void {
+  for (const key of Object.keys(input)) {
+    const value = input[key]
+    if (value === null) delete input[key]
+    else if (typeof value === "string" && value.trim() === "" && key !== "condition" && key !== "token_file") {
+      delete input[key]
+    }
+  }
+}
+
 function parseScheduleInput(input: ScheduleInput): Partial<Job> {
   const given = [input.schedule, input.every_seconds, input.daily_at, input.once_in_seconds].filter(
     (value) => value !== undefined,
@@ -224,6 +236,49 @@ function parseScheduleInput(input: ScheduleInput): Partial<Job> {
     throw new Error(`once_in_seconds must be at least ${MIN_SECONDS}`)
   }
   return { onceInSeconds: Math.round(input.once_in_seconds) }
+}
+
+function selectSchedule(
+  input: ScheduleInput,
+  mode: "create" | "update",
+): { patch: Partial<Job>; warnings: string[] } {
+  const provided = SCHEDULE_FIELDS.filter((field) => input[field] !== undefined)
+  if (provided.length === 0) {
+    if (mode === "create") {
+      throw new Error("schedule / every_seconds / daily_at / once_in_seconds: provide exactly one")
+    }
+    return { patch: {}, warnings: [] }
+  }
+  const warnings: string[] = []
+  const valid: Array<{ field: (typeof SCHEDULE_FIELDS)[number]; patch: Partial<Job> }> = []
+  for (const field of provided) {
+    try {
+      valid.push({ field, patch: parseScheduleInput({ [field]: input[field] } as ScheduleInput) })
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      warnings.push(`ignored ${field}=${JSON.stringify(input[field])}: ${detail}`)
+    }
+  }
+  if (valid.length === 0) {
+    throw new Error(
+      `schedule / every_seconds / daily_at / once_in_seconds: provide exactly one (${warnings.join("; ")})`,
+    )
+  }
+  if (valid.length === 1) return { patch: valid[0]!.patch, warnings }
+  if (mode === "update") {
+    return {
+      patch: {},
+      warnings: [...warnings, `kept the existing schedule; ambiguous fields: ${valid.map((item) => item.field).join(", ")}`],
+    }
+  }
+  const chosen = valid[0]!
+  return {
+    patch: chosen.patch,
+    warnings: [
+      ...warnings,
+      `multiple valid schedule fields (${valid.map((item) => item.field).join(", ")}); used ${chosen.field}`,
+    ],
+  }
 }
 
 type CronTool = ReturnType<typeof tool>
@@ -405,23 +460,27 @@ export async function createCron(
     }))
   }
 
-  async function validateJobFields(input: {
-    prompt?: string
-    agent?: string
-    model?: string
-    variant?: string
-  } & ScheduleInput) {
-    if (input.prompt !== undefined && input.prompt.trim().length === 0) {
-      throw new Error("prompt must not be empty")
-    }
+  async function sanitizeJobFields(
+    input: { agent?: string; model?: string; variant?: string },
+    warnings: string[],
+  ): Promise<void> {
     if (input.agent !== undefined) {
       const agents = parseResult(await client.app.agents(), z.array(AgentSchema), "List agents")
       if (!agents.some((agent) => agent.name === input.agent)) {
-        throw new Error(`Unknown agent: ${input.agent}`)
+        warnings.push(`ignored unknown agent "${input.agent}"`)
+        input.agent = undefined
       }
     }
     if (input.model !== undefined) {
-      await resolveSelection(input)
+      try {
+        await resolveSelection(input)
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        const variant = input.variant !== undefined ? ` / variant "${input.variant}"` : ""
+        warnings.push(`ignored model "${input.model}"${variant}: ${detail}`)
+        input.model = undefined
+        input.variant = undefined
+      }
     }
   }
 
@@ -600,7 +659,7 @@ export async function createCron(
 
   const cronTool = tool({
     description:
-      "Manage scheduled tasks (max 32 per worktree). Actions: list (no name required); create/update/remove/enable/disable/run (name required); create also requires prompt. update keeps omitted fields.\n\nSchedule — EXACTLY ONE, chosen by intent:\n- schedule: 5-field cron \"min hour dom month dow\" in server local time (calendar-style; supports *, a-b, a,b, */n)\n- every_seconds: fixed interval in seconds (>= 5)\n- daily_at: \"HH:MM\" 24-hour local time, every day\n- once_in_seconds: one-shot delay in seconds (>= 5); the task is removed after firing\n\nTarget:\n- session (default): injects \"⏰ 定时任务 [<name>] 触发，请执行：<prompt>\" into the conversation where the task was created; if that session is deleted, the task removes itself.\n- task: runs the prompt in a fresh standalone session with restricted permissions (no task/todowrite/primary tools); use for unattended/background work. While a run is in flight, on_busy=queue runs one queued occurrence afterwards, cancel skips.\n\nFields:\n- name: unique, 1-80 chars; prompt: 1-4000 chars (update replaces it, never appends).\n- agent: existing agent name. model: \"provider/model-id\" (provider must be connected; model id may contain /). variant: existing variant, or \"default\".\n- on_busy: queue (default) | cancel. If a one-shot task's fire is dropped by cancel, the task is still consumed.\n- missed: skip (default) | run_once (fire once after restart for missed periods).\n- condition + token_file: condition \"__TOKEN__ # <agent_id> # <mcp endpoint>\", token_file first line = token. Scheduled fires call get_messages first and are skipped while the inbox is empty (fail-closed, no LLM call). run does NOT evaluate this gate.\n\nNotes: OpenCode must be running at the trigger time. update: any provided schedule field replaces the whole schedule configuration. run dispatches immediately and returns; the outcome lands in lastRun. list shows tasks, nextRun and lastRun. create/update validate all fields immediately.\n\nExamples:\ncron({ action: \"create\", name: \"remind\", once_in_seconds: 600, prompt: \"Remind me to redeploy\" })\ncron({ action: \"create\", name: \"nightly\", daily_at: \"09:00\", prompt: \"Review overnight failures\", target: \"task\", model: \"provider/model\", variant: \"high\" })",
+      "Manage scheduled tasks (max 32 per worktree). Actions: list (no name required); create/update/remove/enable/disable/run (name required); create also requires prompt. update keeps omitted fields.\n\nSchedule — EXACTLY ONE, chosen by intent:\n- schedule: 5-field cron \"min hour dom month dow\" in server local time (calendar-style; supports *, a-b, a,b, */n)\n- every_seconds: fixed interval in seconds (>= 5)\n- daily_at: \"HH:MM\" 24-hour local time, every day\n- once_in_seconds: one-shot delay in seconds (>= 5); the task is removed after firing\n\nTarget:\n- session (default): injects \"⏰ 定时任务 [<name>] 触发，请执行：<prompt>\" into the conversation where the task was created; if that session is deleted, the task removes itself.\n- task: runs the prompt in a fresh standalone session with restricted permissions (no task/todowrite/primary tools); use for unattended/background work. While a run is in flight, on_busy=queue runs one queued occurrence afterwards, cancel skips.\n\nFields:\n- name: unique, 1-80 chars; prompt: 1-4000 chars (update replaces it, never appends).\n- agent: existing agent name. model: \"provider/model-id\" (provider must be connected; model id may contain /). variant: existing variant, or \"default\".\n- on_busy: queue (default) | cancel. If a one-shot task's fire is dropped by cancel, the task is still consumed.\n- missed: skip (default) | run_once (fire once after restart for missed periods).\n- condition + token_file: condition \"__TOKEN__ # <agent_id> # <mcp endpoint>\", token_file first line = token. Scheduled fires call get_messages first and are skipped while the inbox is empty (fail-closed, no LLM call). run does NOT evaluate this gate.\n\nNotes: OpenCode must be running at the trigger time. update: a single provided schedule field replaces the whole schedule configuration. run dispatches immediately and returns; the outcome lands in lastRun. list shows tasks, nextRun and lastRun. Providers that pad unused optional fields with placeholders (null, empty, \"x\", 0) are tolerated: invalid optional values are dropped and reported in warnings, and when several schedule fields are valid, create uses schedule > every_seconds > daily_at > once_in_seconds while update keeps the existing schedule.\n\nExamples:\ncron({ action: \"create\", name: \"remind\", once_in_seconds: 600, prompt: \"Remind me to redeploy\" })\ncron({ action: \"create\", name: \"nightly\", daily_at: \"09:00\", prompt: \"Review overnight failures\", target: \"task\", model: \"provider/model\", variant: \"high\" })",
     args: {
       action: tool.schema.enum(["list", "create", "update", "remove", "enable", "disable", "run"]),
       name: tool.schema.string().min(1).optional(),
@@ -625,25 +684,36 @@ export async function createCron(
           return JSON.stringify({ jobs: list }, null, 2)
         }
         case "create": {
+          dropBlankValues(input as unknown as Record<string, unknown>)
           if (!input.name) throw new Error("name is required to create a task")
           if (!input.prompt) throw new Error("prompt is required to create a task")
           if (jobs.size >= MAX_JOBS) throw new Error(`Task limit reached (${MAX_JOBS}); remove a task first`)
           const name = input.name.trim().slice(0, MAX_NAME)
           const prompt = input.prompt.trim().slice(0, MAX_PROMPT)
           if (!name) throw new Error("name must not be empty")
-          if (!prompt) throw new Error("prompt must not be empty")
           if (jobs.has(name)) throw new Error(`A task named "${name}" already exists`)
-          const schedule = parseScheduleInput(input)
-          await validateJobFields({ ...input, prompt })
+          const warnings: string[] = []
+          const selection = selectSchedule(input, "create")
+          warnings.push(...selection.warnings)
+          await sanitizeJobFields(input, warnings)
           if (input.condition !== undefined && input.condition.trim() !== "") {
             // Shape-check now so mistakes surface before the first fire.
-            parseCondition(input.condition)
-            if (!input.token_file) throw new Error("token_file is required when condition is set")
+            try {
+              parseCondition(input.condition)
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error)
+              warnings.push(`ignored condition=${JSON.stringify(input.condition)}: ${detail}`)
+              input.condition = undefined
+              input.token_file = undefined
+            }
+            if (input.condition !== undefined && !input.token_file) {
+              throw new Error("token_file is required when condition is set")
+            }
           }
           const job: Job = {
             name,
             prompt,
-            ...schedule,
+            ...selection.patch,
             target: input.target ?? "session",
             sessionID: context.sessionID,
             agent: input.agent,
@@ -659,27 +729,30 @@ export async function createCron(
           jobs.set(job.name, job)
           scheduleJob(job, { persist: false })
           await persist()
-          return JSON.stringify({ created: jobSummary(job) }, null, 2)
+          const response: Record<string, unknown> = { created: jobSummary(job) }
+          if (warnings.length > 0) response.warnings = warnings
+          return JSON.stringify(response, null, 2)
         }
         case "update": {
+          dropBlankValues(input as unknown as Record<string, unknown>)
           if (!input.name) throw new Error("name is required to update a task")
           const job = jobs.get(input.name)
           if (!job) throw new Error(`Unknown task: ${input.name}`)
-          // A provided schedule field replaces the whole schedule configuration.
-          if (input.schedule !== undefined || input.every_seconds !== undefined || input.daily_at !== undefined || input.once_in_seconds !== undefined) {
-            const schedule = parseScheduleInput(input)
+          const warnings: string[] = []
+          // A single provided schedule field replaces the whole schedule configuration.
+          const selection = selectSchedule(input, "update")
+          warnings.push(...selection.warnings)
+          if (Object.keys(selection.patch).length > 0) {
             delete job.schedule
             delete job.everySeconds
             delete job.dailyAt
             delete job.onceInSeconds
-            Object.assign(job, schedule)
+            Object.assign(job, selection.patch)
           }
           if (input.prompt !== undefined) {
-            const prompt = input.prompt.trim().slice(0, MAX_PROMPT)
-            if (!prompt) throw new Error("prompt must not be empty")
-            job.prompt = prompt
+            job.prompt = input.prompt.trim().slice(0, MAX_PROMPT)
           }
-          await validateJobFields(input)
+          await sanitizeJobFields(input, warnings)
           if (input.agent !== undefined) job.agent = input.agent
           if (input.model !== undefined) job.model = input.model
           if (input.variant !== undefined) job.variant = normalizeVariant(input.variant)
@@ -688,17 +761,26 @@ export async function createCron(
           if (input.target !== undefined) job.target = input.target
           if (input.condition !== undefined) {
             if (input.condition.trim() !== "") {
-              parseCondition(input.condition)
-              if (input.token_file === undefined && !job.tokenFile) {
+              try {
+                parseCondition(input.condition)
+              } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error)
+                warnings.push(`ignored condition=${JSON.stringify(input.condition)}: ${detail}`)
+                input.condition = undefined
+                input.token_file = undefined
+              }
+              if (input.condition !== undefined && input.token_file === undefined && !job.tokenFile) {
                 throw new Error("token_file is required when condition is set")
               }
             }
-            job.condition = input.condition.trim() || undefined
+            if (input.condition !== undefined) job.condition = input.condition.trim() || undefined
           }
           if (input.token_file !== undefined) job.tokenFile = input.token_file.trim() || undefined
           scheduleJob(job, { persist: false })
           await persist()
-          return JSON.stringify({ updated: jobSummary(job) }, null, 2)
+          const response: Record<string, unknown> = { updated: jobSummary(job) }
+          if (warnings.length > 0) response.warnings = warnings
+          return JSON.stringify(response, null, 2)
         }
         case "remove": {
           if (!input.name) throw new Error("name is required to remove a task")
