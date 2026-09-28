@@ -234,6 +234,20 @@ describe("cron tool", () => {
     })
     expect(single.updated.schedule).toBe("30 11 * * *")
     expect(single.updated.everySeconds).toBeUndefined()
+
+    const junk = await call(tool.cron, {
+      action: "update",
+      name: "job",
+      schedule: "x",
+      every_seconds: 0,
+      daily_at: "x",
+      once_in_seconds: 0,
+      agent: "x",
+      model: "x",
+      condition: "x",
+    })
+    expect(junk.updated.schedule).toBe("30 11 * * *")
+    expect(junk.warnings.some((warning: string) => warning.includes("kept the existing schedule"))).toBe(true)
     await dispose()
   })
 

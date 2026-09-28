@@ -260,6 +260,12 @@ function selectSchedule(
     }
   }
   if (valid.length === 0) {
+    if (mode === "update") {
+      return {
+        patch: {},
+        warnings: [...warnings, "kept the existing schedule; no valid schedule field"],
+      }
+    }
     throw new Error(
       `schedule / every_seconds / daily_at / once_in_seconds: provide exactly one (${warnings.join("; ")})`,
     )
@@ -659,7 +665,7 @@ export async function createCron(
 
   const cronTool = tool({
     description:
-      "Manage scheduled tasks. A task runs a prompt either by injecting it into the session it was created in (target session, default; idle sessions start a new turn, busy sessions follow on_busy) or in a fresh standalone session (target task). Schedule is exactly one of: 5-field cron expression (schedule, server local time), every_seconds, daily_at (\"HH:MM\" local), once_in_seconds. Optional Harbor condition gate: condition \"__TOKEN__ # <agent_id> # <mcp endpoint>\" plus token_file (first line = token) checks get_messages first and skips the fire while the inbox is empty — no LLM call, no wasted tokens. OpenCode must be running at the trigger time. Use the list action to see existing tasks, their next run time, and last run status. Placeholders in unused fields (null, empty, 0) and invalid optional values (agent, model, variant, condition) are ignored and reported in warnings; if several schedule fields are valid, create uses schedule > every_seconds > daily_at > once_in_seconds and update keeps the existing schedule.",
+      "Manage scheduled tasks. A task runs a prompt either by injecting it into the session it was created in (target session, default; idle sessions start a new turn, busy sessions follow on_busy) or in a fresh standalone session (target task). Schedule is exactly one of: 5-field cron expression (schedule, server local time), every_seconds, daily_at (\"HH:MM\" local), once_in_seconds. Optional Harbor condition gate: condition \"__TOKEN__ # <agent_id> # <mcp endpoint>\" plus token_file (first line = token) checks get_messages first and skips the fire while the inbox is empty — no LLM call, no wasted tokens. OpenCode must be running at the trigger time. Use the list action to see existing tasks, their next run time, and last run status. Placeholders in unused fields (null, empty, 0) and invalid optional values (agent, model, variant, condition) are ignored and reported in warnings; create resolves multiple valid schedule fields in the order schedule > every_seconds > daily_at > once_in_seconds; update keeps the existing schedule when several or none are valid.",
     args: {
       action: tool.schema.enum(["list", "create", "update", "remove", "enable", "disable", "run"]),
       name: tool.schema.string().min(1).optional(),
